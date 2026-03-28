@@ -15,6 +15,8 @@ export const listSports = createServerFn().handler(async () => {
 
 type GetOddsBySportInput = {
   sport: string
+  commenceTimeFrom?: string
+  commenceTimeTo?: string
 }
 
 export const getOddsBySport = createServerFn({ method: 'GET' })
@@ -30,7 +32,19 @@ export const getOddsBySport = createServerFn({ method: 'GET' })
       throw new Error('A sport key is required to fetch odds.')
     }
 
-    return { sport }
+    const commenceTimeFromValue = (input as GetOddsBySportInput).commenceTimeFrom
+    const commenceTimeToValue = (input as GetOddsBySportInput).commenceTimeTo
+
+    const commenceTimeFrom =
+      typeof commenceTimeFromValue === 'string'
+        ? commenceTimeFromValue.trim()
+        : undefined
+    const commenceTimeTo =
+      typeof commenceTimeToValue === 'string'
+        ? commenceTimeToValue.trim()
+        : undefined
+
+    return { sport, commenceTimeFrom, commenceTimeTo }
   })
   .handler(async ({ data }) => {
     const apiKey = process.env.ODDS_API_KEY
@@ -39,21 +53,79 @@ export const getOddsBySport = createServerFn({ method: 'GET' })
       throw new Error('ODDS_API_KEY is not configured.')
     }
 
-    const url = new URL(`${BASE_URL}/sports/${data.sport}/odds`)
-    url.searchParams.set('apiKey', apiKey)
-    url.searchParams.set('regions', 'us')
-    url.searchParams.set('markets', 'h2h')
+    const fetchOdds = async (markets: string) => {
+      const url = new URL(`${BASE_URL}/sports/${data.sport}/odds`)
+      url.searchParams.set('apiKey', apiKey)
+      url.searchParams.set('regions', 'us')
+      url.searchParams.set('markets', markets)
+      url.searchParams.set('oddsFormat', 'american')
+      url.searchParams.set('dateFormat', 'iso')
 
-    const response = await fetch(url.toString(), {
-      method: 'GET',
-    })
+      if (data.commenceTimeFrom) {
+        url.searchParams.set('commenceTimeFrom', data.commenceTimeFrom)
+      }
 
-    if (!response.ok) {
-      const errorText = await response.text()
+      if (data.commenceTimeTo) {
+        url.searchParams.set('commenceTimeTo', data.commenceTimeTo)
+      }
+
+      const response = await fetch(url.toString(), {
+        method: 'GET',
+      })
+
+      const responseText = await response.text()
+      let parsedBody: unknown = responseText
+
+      try {
+        parsedBody = JSON.parse(responseText)
+      } catch {
+        // Keep plain text body when response is not JSON.
+      }
+
+      return { response, parsedBody, responseText }
+    }
+
+    const initial = await fetchOdds('h2h,spreads,totals')
+
+    if (initial.response.ok) {
+      if (
+        typeof initial.parsedBody === 'object' &&
+        initial.parsedBody !== null
+      ) {
+        return initial.parsedBody
+      }
+
       throw new Error(
-        `Failed to fetch odds for "${data.sport}" (${response.status}): ${errorText}`,
+        `Unexpected odds response for "${data.sport}": ${initial.responseText}`,
       )
     }
 
-    return response.json()
+    const isInvalidMarketCombo =
+      initial.response.status === 422 &&
+      typeof initial.parsedBody === 'object' &&
+      initial.parsedBody !== null &&
+      'error_code' in initial.parsedBody &&
+      (initial.parsedBody as { error_code?: string }).error_code ===
+        'INVALID_MARKET_COMBO'
+
+    if (isInvalidMarketCombo) {
+      const fallback = await fetchOdds('outrights')
+
+      if (fallback.response.ok) {
+        if (
+          typeof fallback.parsedBody === 'object' &&
+          fallback.parsedBody !== null
+        ) {
+          return fallback.parsedBody
+        }
+
+        throw new Error(
+          `Unexpected odds response for "${data.sport}": ${fallback.responseText}`,
+        )
+      }
+    }
+
+    throw new Error(
+      `Failed to fetch odds for "${data.sport}" (${initial.response.status}): ${initial.responseText}`,
+    )
   })
